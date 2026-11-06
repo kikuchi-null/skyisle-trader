@@ -18,22 +18,23 @@ func newMarket(good GoodID, a Attr) Market {
 func (m *Market) Traded() bool { return m.Attr != AttrNone }
 
 func (m *Market) SellPrice() int {
-	amount, _ := trade(m.Price, false)
+	amount, _ := m.trade(m.Price, false, 0)
 	return amount
 }
 
-// trade は現在価格 price で 1 個売買したときの金額と、その後の現在価格を返す。
-func trade(price int, buy bool) (amount, next int) {
+// trade は現在価格 price で 1 個売買したときの金額と、その後の現在価格を返す。impact は価格の動き(千分率)。
+// 売りに下限があるのは、価格を崩して安く買い戻す往復で儲からないようにするため。
+func (m *Market) trade(price int, buy bool, impact int) (amount, next int) {
 	if buy {
-		return price, price * buyImpactPct / 100
+		return price, price * (1000 + impact) / 1000
 	}
-	return price * sellPct / 100, price * sellImpactPct / 100
+	return price * sellPct / 100, max(price*(1000-impact)/1000, m.Init*minPricePct/100)
 }
 
 // quote は現在価格 price から n 個を 1 個ずつ順に売買した合計額と、その後の現在価格を返す。
-func quote(price, n int, buy bool) (total, next int) {
+func (m *Market) quote(price, n int, buy bool, impact int) (total, next int) {
 	for range n {
-		amount, next := trade(price, buy)
+		amount, next := m.trade(price, buy, impact)
 		total, price = total+amount, next
 	}
 	return total, price

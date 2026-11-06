@@ -49,8 +49,16 @@ const (
 	modeTrade
 	modeSelectDest
 	modeVoyage
-	modeConfirm // 終了か拡張の確認。どちらかは confirmUpgrade で区別する
+	modeConfirm // 確認。何の確認かは confirm で区別する
 	modeEnd
+)
+
+type confirmKind int
+
+const (
+	confirmQuit confirmKind = iota
+	confirmUpgrade
+	confirmInvest
 )
 
 // tickMsg は航行アニメーションを 1 コマ進める。voyage が今の航行と違うものは捨てる。
@@ -75,7 +83,7 @@ type Model struct {
 	frame  int
 	voyage int // 航行の通し番号
 
-	confirmUpgrade bool
+	confirm confirmKind
 }
 
 func New(g *game.Game) Model {
@@ -149,9 +157,15 @@ func (m Model) updateNormal(key string) Model {
 			m.report(game.ErrNoMoney, "")
 			break
 		}
-		m.mode, m.confirmUpgrade = modeConfirm, true
+		m.mode, m.confirm = modeConfirm, confirmUpgrade
+	case "i":
+		if err := m.g.CanInvest(); err != nil {
+			m.report(err, "")
+			break
+		}
+		m.mode, m.confirm = modeConfirm, confirmInvest
 	case "q":
-		m.mode, m.confirmUpgrade = modeConfirm, false
+		m.mode, m.confirm = modeConfirm, confirmQuit
 	}
 	return m
 }
@@ -162,12 +176,18 @@ func (m Model) updateConfirm(key string) Model {
 	if key != "y" && key != "Y" {
 		return m
 	}
-	if !m.confirmUpgrade {
+	g := m.g
+	switch m.confirm {
+	case confirmQuit:
 		m.mode = modeEnd
-		return m
+	case confirmUpgrade:
+		cost := g.UpgradeCost()
+		m.report(g.Upgrade(), fmt.Sprintf("積載量を %d に拡張 (%sG)", g.Capacity, comma(cost)))
+	case confirmInvest:
+		cost := g.InvestCost()
+		err := g.Invest()
+		m.report(err, fmt.Sprintf("%sの港を %d に整備 (%sG)", game.IslandDefs[g.Here].Name, g.Islands[g.Here].Port, comma(cost)))
 	}
-	cost := m.g.UpgradeCost()
-	m.report(m.g.Upgrade(), fmt.Sprintf("積載量を %d に拡張 (%sG)", m.g.Capacity, comma(cost)))
 	return m
 }
 
@@ -493,7 +513,7 @@ func (m Model) headerLines() []string {
 	}
 	return []string{
 		dayLine,
-		"所持金 " + comma(g.Money) + "G  スコア " + signed(g.Score()),
+		"所持金 " + comma(g.Money) + "G スコア " + signed(g.Score()),
 		fmt.Sprintf("%s  積荷 %d/%d", place, g.Load(), g.Capacity),
 		"",
 	}
@@ -501,8 +521,9 @@ func (m Model) headerLines() []string {
 
 func (m Model) marketLines() []string {
 	g := m.g
+	port := g.Islands[g.Here].Port
 	lines := []string{
-		rule("相場 " + game.IslandDefs[g.Here].Name),
+		rule(fmt.Sprintf("相場 %s  港 %d/%d 値動き %s%%", game.IslandDefs[g.Here].Name, port, len(game.PortImpacts)-1, impactPct(port))),
 		dimStyle.Render("  " + padR("品目", 6) + " " + padL("買値", 7) + " " + padL("売値", 7) + " 属性 " + padL("積荷", 4)),
 	}
 	for j, gd := range game.Goods {
@@ -594,6 +615,7 @@ func (m Model) destLines() []string {
 			head += " " + dimStyle.Render(gd.Short)
 		}
 	}
+	head += dimStyle.Render(" 港")
 	lines := []string{rule("出航先"), head}
 	for i, def := range game.IslandDefs {
 		id := game.IslandID(i)
@@ -610,6 +632,7 @@ func (m Model) destLines() []string {
 			}
 			row += " " + st.Render(game.Attrs[mk.Attr].Short)
 		}
+		row += " " + padL(strconv.Itoa(g.Islands[i].Port), 2)
 		if gray {
 			row = dimStyle.Render(row)
 		}
@@ -656,12 +679,20 @@ func (m Model) cursor(on bool) string {
 func (m Model) footerLines() []string {
 	g := m.g
 	if m.mode == modeConfirm {
-		if m.confirmUpgrade {
+		switch m.confirm {
+		case confirmUpgrade:
 			cost := g.UpgradeCost()
 			return []string{
 				fmt.Sprintf("積載量 %d → %d  費用 %sG", g.Capacity, g.Capacity+game.UpgradeStep, comma(cost)),
 				fmt.Sprintf("所持金 %s → %sG", comma(g.Money), comma(g.Money-cost)),
 				hereStyle.Render("拡張しますか? (y/n)"),
+			}
+		case confirmInvest:
+			port, cost := g.Islands[g.Here].Port, g.InvestCost()
+			return []string{
+				fmt.Sprintf("%sの港 %d → %d  値動き %s → %s%%", game.IslandDefs[g.Here].Name, port, port+1, impactPct(port), impactPct(port+1)),
+				fmt.Sprintf("費用 %sG  残金 %sG", comma(cost), comma(g.Money-cost)),
+				hereStyle.Render("投資しますか? (y/n)"),
 			}
 		}
 		warn := ""
@@ -680,12 +711,12 @@ func (m Model) footerLines() []string {
 	case modeNormal:
 		help = []string{
 			hints("↑↓", "選択", "[b]", "買う", "[s]", "売る", "[t]", "出航"),
-			hints("[w]", "待機", "[u]", "拡張", "[q]", "終了"),
+			hints("[w]", "待機", "[u]", "拡張", "[i]", "投資", "[q]", "終了"),
 		}
 		if g.Over() {
 			help = []string{
 				hints("↑↓", "選択", "[b]", "買う", "[s]", "売る", "[u]", "拡張"),
-				hints("[q]", "終了してスコアを確定"),
+				hints("[i]", "投資", "[q]", "終了してスコアを確定"),
 			}
 		}
 	case modeTrade:
@@ -778,6 +809,11 @@ func rule(title string) string {
 
 func padR(s string, w int) string { return s + strings.Repeat(" ", max(w-lipgloss.Width(s), 0)) }
 func padL(s string, w int) string { return strings.Repeat(" ", max(w-lipgloss.Width(s), 0)) + s }
+
+// impactPct は港の段階 port の値動きを百分率で書く。
+func impactPct(port int) string {
+	return fmt.Sprintf("%.1f", float64(game.PortImpacts[port])/10)
+}
 
 // comma は 3 桁ごとにカンマを入れる。
 func comma(n int) string {

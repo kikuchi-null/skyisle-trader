@@ -16,6 +16,7 @@ const (
 	startCapacity   = 200       // 積載量の初期値
 	UpgradeStep     = 100       // 拡張 1 回で増える積載量
 	upgradeBaseCost = 200_000   // n 回目の拡張費用は upgradeBaseCost × n
+	investBaseCost  = 500_000   // 港の段階を n に上げる費用は investBaseCost × n
 
 	mapW, mapH         = 60.0, 40.0 // 空域の広さ(論理座標)
 	minIslandGap       = 10.0       // 初期配置での島同士の最小距離
@@ -25,12 +26,14 @@ const (
 	notTradedProb = 0.5 // 島が 1 品目を取扱なしにする確率
 
 	sellPct            = 90   // 売値 = 現在価格 × 90%
-	buyImpactPct       = 101  // 1 個買うごとに現在価格 × 101%
-	sellImpactPct      = 99   // 1 個売るごとに現在価格 × 99%
+	minPricePct        = 30   // いくら売っても、現在価格は初期値の 30% より下がらない
 	fluctuationRate    = 0.05 // 基準価格の日次の揺らぎ幅(±)
 	fluctuationBandPct = 30   // 基準価格は初期値の ±30% に収める
 	restorePct         = 15   // 現在価格は毎日、基準価格との差の 15% だけ戻る
 )
+
+// PortImpacts は港の段階ごとの、1 個売買したときの価格の動き(千分率)。添字は Island.Port。
+var PortImpacts = []int{10, 5, 3}
 
 // GoodID は Goods の添字。
 type GoodID int
@@ -100,6 +103,7 @@ var (
 	ErrBadAmount    = errors.New("個数は 1 以上を指定してください")
 	ErrSameIsland   = errors.New("現在地には出航できません")
 	ErrTooLate      = errors.New("最終日を過ぎてしまいます")
+	ErrMaxPort      = errors.New("この島の港はこれ以上整備できません")
 )
 
 type Game struct {
@@ -148,6 +152,11 @@ func (g *Game) market(good GoodID) *Market {
 	return &g.Islands[g.Here].Market[good]
 }
 
+// impact は island の港の段階に応じた、1 個あたりの価格の動き(千分率)。
+func (g *Game) impact(island IslandID) int {
+	return PortImpacts[g.Islands[island].Port]
+}
+
 // Quote は現在地で good を n 個売買したときの合計額と、取引後の現在価格を返す。状態は変えない。
 // エラーは Buy / Sell が返すのと同じ。所持金不足のときは、合計額と価格を返したうえでエラーにする。
 // 金額は積載量と在庫の検証を通ったときだけ計算する(n が積載量か在庫の数で抑えられ、ループが有限になる)。
@@ -163,7 +172,7 @@ func (g *Game) Quote(good GoodID, n int, buy bool) (total, price int, err error)
 	case !buy && n > g.Cargo[good]:
 		return 0, 0, ErrNoStock
 	}
-	total, price = quote(m.Price, n, buy)
+	total, price = m.quote(m.Price, n, buy, g.impact(g.Here))
 	if buy && total > g.Money {
 		err = ErrNoMoney
 	}
@@ -203,11 +212,11 @@ func (g *Game) CostOf(good GoodID, n int) int {
 }
 
 // Estimate は dest で売れる積荷をすべて売ったときの売却額の目安と、その仕入れ額を返す。
-// 他の島の現在価格は見えないので、公開されている属性どおりの価格(Market.Init)から計算する。
+// 他の島の現在価格は見えないので、公開されている属性どおりの価格(Market.Init)と港の段階から計算する。
 func (g *Game) Estimate(dest IslandID) (sales, cost int) {
 	for j, n := range g.Cargo {
 		if m := g.Islands[dest].Market[j]; n > 0 && m.Traded() {
-			total, _ := quote(m.Init, n, false)
+			total, _ := m.quote(m.Init, n, false, g.impact(dest))
 			sales += total
 			cost += g.Cost[j]
 		}
@@ -228,7 +237,7 @@ func (g *Game) MaxTrade(good GoodID, buy bool) int {
 	limit := (g.Capacity - g.Load()) / Goods[good].Weight
 	n, total, price := 0, 0, m.Price
 	for n < limit {
-		amount, next := trade(price, true)
+		amount, next := m.trade(price, true, g.impact(g.Here))
 		if total+amount > g.Money {
 			break
 		}
@@ -249,6 +258,32 @@ func (g *Game) Upgrade() error {
 	g.Money -= cost
 	g.Capacity += UpgradeStep
 	g.Upgrades++
+	return nil
+}
+
+// InvestCost は現在地の港を次の段階に上げる費用。
+func (g *Game) InvestCost() int {
+	return investBaseCost * (g.Islands[g.Here].Port + 1)
+}
+
+// CanInvest は現在地の港に投資できるかを返す。
+func (g *Game) CanInvest() error {
+	switch {
+	case g.Islands[g.Here].Port == len(PortImpacts)-1:
+		return ErrMaxPort
+	case g.InvestCost() > g.Money:
+		return ErrNoMoney
+	}
+	return nil
+}
+
+// Invest は現在地の港を 1 段階上げる。
+func (g *Game) Invest() error {
+	if err := g.CanInvest(); err != nil {
+		return err
+	}
+	g.Money -= g.InvestCost()
+	g.Islands[g.Here].Port++
 	return nil
 }
 
@@ -286,7 +321,7 @@ func (g *Game) Wait() error {
 
 func (g *Game) Score() int { return g.Money - StartMoney }
 
-// Over は最終日に達したら true。その後も売買と拡張はできる。
+// Over は最終日に達したら true。その後も売買と拡張と投資はできる。
 func (g *Game) Over() bool { return g.Day >= LastDay }
 
 // advanceDay は日付を 1 日進める。日付が進むのはここだけ。
