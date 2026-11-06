@@ -1,6 +1,7 @@
 package game
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
@@ -264,6 +265,167 @@ func TestEstimate(t *testing.T) {
 	}
 }
 
+func TestInvest(t *testing.T) {
+	g := fixture(20)
+	g.Money = 3_000_000
+	for _, c := range []struct{ cost, port int }{{500_000, 1}, {1_000_000, 2}} {
+		before := g.Money
+		if got := g.InvestCost(); got != c.cost {
+			t.Errorf("段階 %d の費用 = %d, want %d", c.port, got, c.cost)
+		}
+		if err := g.Invest(); err != nil {
+			t.Fatal(err)
+		}
+		if g.Money != before-c.cost || g.Islands[0].Port != c.port {
+			t.Errorf("投資後: 所持金 %d, 段階 %d", g.Money, g.Islands[0].Port)
+		}
+	}
+	if g.Islands[1].Port != 0 {
+		t.Errorf("他の島の段階 %d", g.Islands[1].Port)
+	}
+	g.Here = 1
+	if got := g.InvestCost(); got != 500_000 {
+		t.Errorf("他の島の費用 = %d", got)
+	}
+
+	// 所持金ちょうどなら投資できる
+	g.Money = g.InvestCost()
+	if err := g.Invest(); err != nil || g.Money != 0 {
+		t.Errorf("所持金ちょうどの投資: %v, 所持金 %d", err, g.Money)
+	}
+}
+
+func TestPortImpact(t *testing.T) {
+	for _, c := range []struct{ port, buy, buyPrice, sell, sellPrice int }{
+		{0, 10000 + 10100, 10201, 9000 + 8910, 9801},
+		{1, 10000 + 10050, 10100, 9000 + 8955, 9900},
+		{2, 10000 + 10030, 10060, 9000 + 8973, 9940},
+	} {
+		g := fixture(20)
+		g.Islands[0].Port = c.port
+		g.Cargo[stone] = 2
+		if total, price, err := g.Quote(stone, 2, true); err != nil || total != c.buy || price != c.buyPrice {
+			t.Errorf("段階 %d の買い: %d, %d, %v", c.port, total, price, err)
+		}
+		if total, price, err := g.Quote(stone, 2, false); err != nil || total != c.sell || price != c.sellPrice {
+			t.Errorf("段階 %d の売り: %d, %d, %v", c.port, total, price, err)
+		}
+		if err := g.Sell(stone, 2); err != nil || g.market(stone).Price != c.sellPrice {
+			t.Errorf("段階 %d で売った後の価格 %d, %v", c.port, g.market(stone).Price, err)
+		}
+	}
+
+	// 所持金で決まる最大数: 2 個で段階 0 は 20,100G、段階 2 は 20,030G かかる
+	g := fixture(20)
+	g.Money = 20050
+	if got := g.MaxTrade(stone, true); got != 1 {
+		t.Errorf("段階 0 の最大数 = %d", got)
+	}
+	g.Islands[0].Port = 2
+	if got := g.MaxTrade(stone, true); got != 2 {
+		t.Errorf("段階 2 の最大数 = %d", got)
+	}
+
+	// 売却の目安は行き先の段階で計算する
+	g = fixture(20)
+	g.Cargo[stone] = 2
+	g.Islands[1].Market[stone] = newMarket(stone, AttrDemand) // 16,000
+	g.Islands[1].Port = 2
+	if sales, _ := g.Estimate(1); sales != 14400+14356 {
+		t.Errorf("段階 2 の島の売却目安 = %d", sales)
+	}
+}
+
+// TestNoWashTrade は、移動せずに売って買い戻すのを繰り返しても儲からないことを確かめる。
+// 価格に下限がないと、価格を 0G 近くまで崩して、ほぼ無料で買い戻せてしまう。
+func TestNoWashTrade(t *testing.T) {
+	for j := range Goods {
+		good := GoodID(j)
+		for a := range AttrNone {
+			for port := range PortImpacts {
+				for _, n := range []int{1, 30, 100, 300, 1000} {
+					g := fixture(20)
+					g.Islands[0].Market[j] = newMarket(good, a)
+					g.Islands[0].Port = port
+					g.Capacity = n * Goods[j].Weight
+					g.Cargo[j] = n
+					g.Money = 1 << 40
+					before := g.Money
+					for range 20 {
+						if err := g.Sell(good, n); err != nil {
+							t.Fatal(err)
+						}
+						if err := g.Buy(good, n); err != nil {
+							t.Fatal(err)
+						}
+						if err := g.Wait(); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if g.Money >= before {
+						t.Errorf("%s 属性 %s 段階 %d × %d: %+d G", Goods[j].Name, Attrs[a].Name, port, n, g.Money-before)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestMinPrice(t *testing.T) {
+	g := fixture(20)
+	m := g.market(stone) // 現在価格 10,000、下限 3,000
+	g.Cargo[stone] = 1000
+	g.Capacity = 4000
+	if err := g.Sell(stone, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if m.Price != 3000 {
+		t.Errorf("売り崩した後の価格 %d, want 3000", m.Price)
+	}
+	if err := g.Buy(stone, 1); err != nil || m.Price != 3030 {
+		t.Errorf("下限からの買い: 価格 %d, %v", m.Price, err)
+	}
+}
+
+// TestInvestPayback は、費用を含めて、早い投資は得をし、遅い投資は損をすることを確かめる。
+func TestInvestPayback(t *testing.T) {
+	play := func(investFrom int) int {
+		g := fixture(24) // 移動日数 3。価格が戻る時間をとる
+		for j := range Goods {
+			g.Islands[0].Market[j] = newMarket(GoodID(j), AttrSpecialty)
+			g.Islands[1].Market[j] = newMarket(GoodID(j), AttrDemand)
+		}
+		for g.Day+g.TravelDays(1) <= LastDay {
+			if err := g.Buy(stone, 30); err != nil { // 積みすぎると価格が戻りきらず赤字になる
+				t.Fatal(err)
+			}
+			if _, err := g.Sail(1); err != nil {
+				t.Fatal(err)
+			}
+			if g.Day >= investFrom && g.Islands[1].Port == 0 {
+				if err := g.Invest(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := g.Sell(stone, g.Cargo[stone]); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := g.Sail(0); err != nil {
+				break // 最終日に売り切った
+			}
+		}
+		return g.Score()
+	}
+	none, early, late := play(LastDay+1), play(1), play(LastDay-4)
+	t.Logf("投資なし %d, 早い投資 %d, 遅い投資 %d", none, early, late)
+	if early <= none {
+		t.Errorf("早い投資で得をしない: %d <= %d", early, none)
+	}
+	if late >= none {
+		t.Errorf("遅い投資で損をしない: %d >= %d", late, none)
+	}
+}
+
 func TestRestore(t *testing.T) {
 	for _, c := range []struct{ price, want int }{
 		{12000, 11700},
@@ -359,6 +521,9 @@ func TestErrors(t *testing.T) {
 		{"0 個の購入", nil, func(g *Game) error { return g.Buy(stone, 0) }, ErrBadAmount},
 		{"負の個数の売却", func(g *Game) { g.Cargo[stone] = 1 }, func(g *Game) error { return g.Sell(stone, -1) }, ErrBadAmount},
 		{"拡張の所持金不足", func(g *Game) { g.Money = upgradeBaseCost - 1 }, func(g *Game) error { return g.Upgrade() }, ErrNoMoney},
+		{"最大段階への投資", func(g *Game) { g.Islands[0].Port = len(PortImpacts) - 1 }, func(g *Game) error { return g.Invest() }, ErrMaxPort},
+		{"投資の所持金不足", func(g *Game) { g.Money = investBaseCost - 1 }, func(g *Game) error { return g.Invest() }, ErrNoMoney},
+		{"所持金不足より最大段階を先に判定", func(g *Game) { g.Islands[0].Port = len(PortImpacts) - 1; g.Money = 0 }, func(g *Game) error { return g.Invest() }, ErrMaxPort},
 		{"現在地への出航", nil, func(g *Game) error { _, err := g.Sail(0); return err }, ErrSameIsland},
 		{"Day 100 を超える出航", func(g *Game) { g.Day = LastDay - 2 }, func(g *Game) error { _, err := g.Sail(1); return err }, ErrTooLate},
 		{"Day 100 での待機", func(g *Game) { g.Day = LastDay }, func(g *Game) error { return g.Wait() }, ErrTooLate},
@@ -422,6 +587,9 @@ func TestEnd(t *testing.T) {
 	if err := g.Upgrade(); err != nil {
 		t.Errorf("Day 100 の拡張: %v", err)
 	}
+	if err := g.Invest(); err != nil {
+		t.Errorf("Day 100 の投資: %v", err)
+	}
 	if g.Score() != g.Money-StartMoney || g.Score() >= 0 {
 		t.Errorf("Score = %d, 所持金 %d", g.Score(), g.Money)
 	}
@@ -432,6 +600,7 @@ func TestEnd(t *testing.T) {
 }
 
 // randomOp は乱数で選んだ操作を 1 つ行う。エラーは無視する。
+// TestGolden の値が変わるので、操作を足さない。投資は randomOpInvest で混ぜる。
 func randomOp(g *Game, r *rand.Rand) {
 	good := GoodID(r.IntN(len(Goods)))
 	switch r.IntN(7) {
@@ -452,12 +621,43 @@ func randomOp(g *Game, r *rand.Rand) {
 	}
 }
 
+// TestGolden は既存の結果が変わらないことを確かめる。値が変わるのは、シードの互換が切れたとき。
+// 比較するフィールドを明示しているので、Game に状態を足してもここは変わらない。
+// 浮動小数の最下位桁は CPU によって違うことがある(FMA)ので、位置は丸めて比べる。
+func TestGolden(t *testing.T) {
+	const want = "024fcb999c7ee6bb2846b9691562b61dc4442e0612be4e154fe2c26ba3b06a5e"
+	h := sha256.New()
+	for seed := range int64(20) {
+		g := New(seed)
+		r := rand.New(rand.NewPCG(uint64(seed), 1))
+		for range 300 {
+			randomOp(g, r)
+		}
+		fmt.Fprint(h, g.Day, g.Money, g.Here, g.Cargo, g.Cost, g.Capacity, g.Upgrades)
+		for _, is := range g.Islands {
+			fmt.Fprintf(h, "%.6f %.6f %v", is.Pos.X, is.Pos.Y, is.Market)
+		}
+	}
+	if got := fmt.Sprintf("%x", h.Sum(nil)); got != want {
+		t.Errorf("hash = %s, want %s", got, want)
+	}
+}
+
+// randomOpInvest は randomOp に投資を混ぜる。
+func randomOpInvest(g *Game, r *rand.Rand) {
+	if r.IntN(8) == 0 {
+		g.Invest()
+		return
+	}
+	randomOp(g, r)
+}
+
 func TestReproducible(t *testing.T) {
 	play := func(seed int64) string {
 		g := New(seed)
 		r := rand.New(rand.NewPCG(42, 0))
 		for range 500 {
-			randomOp(g, r)
+			randomOpInvest(g, r)
 		}
 		return state(g)
 	}
@@ -474,7 +674,7 @@ func TestInvariants(t *testing.T) {
 	for seed := range int64(20) {
 		g := New(seed)
 		for i := range 5000 {
-			randomOp(g, r)
+			randomOpInvest(g, r)
 			if g.Over() && r.IntN(10) == 0 {
 				g = New(seed + int64(i)*1000) // 最終日に着いたら別の世界でやり直す
 			}
@@ -489,6 +689,9 @@ func TestInvariants(t *testing.T) {
 			for _, is := range g.Islands {
 				if !inSky(is.Pos) {
 					t.Fatalf("seed %d op %d: 島が空域外 %v", seed, i, is.Pos)
+				}
+				if is.Port < 0 || is.Port >= len(PortImpacts) {
+					t.Fatalf("seed %d op %d: 港の段階 %d", seed, i, is.Port)
 				}
 			}
 		}
@@ -538,7 +741,7 @@ func TestBalance(t *testing.T) {
 	for {
 		best, bestGain := -1, 0.0
 		for j, gd := range Goods {
-			gain, _ := trade(sellP[j], false)
+			gain, _ := mixed.Islands[1].Market[j].trade(sellP[j], false, PortImpacts[0])
 			if per := float64(gain-buyP[j]) / float64(gd.Weight); per > bestGain && mixed.Load()+gd.Weight <= mixed.Capacity {
 				best, bestGain = j, per
 			}
@@ -549,8 +752,8 @@ func TestBalance(t *testing.T) {
 		if err := mixed.Buy(GoodID(best), 1); err != nil {
 			t.Fatal(err)
 		}
-		_, buyP[best] = trade(buyP[best], true)
-		_, sellP[best] = trade(sellP[best], false)
+		_, buyP[best] = mixed.Islands[0].Market[best].trade(buyP[best], true, PortImpacts[0])
+		_, sellP[best] = mixed.Islands[1].Market[best].trade(sellP[best], false, PortImpacts[0])
 	}
 	mixedProfit := voyage(mixed)
 	t.Logf("竜の鱗のみ %d G, 積み分け %d G (積荷 %v)", singleProfit, mixedProfit, mixed.Cargo)

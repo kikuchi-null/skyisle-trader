@@ -16,6 +16,7 @@ func lerp(a, b Vec, t float64) Vec {
 type Island struct {
 	Pos, Vel Vec
 	Market   []Market // GoodID ごとの相場
+	Port     int      // 港の段階。PortImpacts の添字
 }
 
 // Snapshot は航行アニメーションの 1 コマ。
